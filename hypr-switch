@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # hypr-switch — symlink-based shell switcher for Hyprland
-# https://github.com/YOUR_USERNAME/hypr-switch
+# https://github.com/bobincraft1/hypr-switch
 #
 # Usage:
 #   hypr-switch              interactive rofi picker
