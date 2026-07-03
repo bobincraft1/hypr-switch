@@ -24,7 +24,6 @@ Shells are **auto-discovered from disk every time `hypr-switch` runs.** There is
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
-- [License](#license)
 
 ---
 
