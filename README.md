@@ -84,7 +84,7 @@ sudo pacman -S rofi libnotify
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/hypr-switch.git
+   git clone https://github.com/bobincraft1/hypr-switch.git
    cd hypr-switch
    ```
 
