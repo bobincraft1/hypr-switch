@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# hypr-switch — symlink-based shell switcher for Hyprland
+# https://github.com/YOUR_USERNAME/hypr-switch
+#
+# Usage:
+#   hypr-switch              interactive rofi picker
+#   hypr-switch <name>       switch directly to shell <name>
+#   hypr-switch --list       list all discovered shells
+#   hypr-switch --reload     reload the current config without switching (no logout)
+#   hypr-switch --help       show usage
+#
+# --- Bash self-guard --------------------------------------------------------
+# This script REQUIRES bash (uses associative arrays, "set -o pipefail", etc).
+# If it's ever invoked via a POSIX shell instead of bash — e.g. something
+# calls it as `sh hypr-switch` rather than executing it directly, which can
+# happen depending on how a keybind/launcher/exec wrapper spawns commands —
+# a plain POSIX shell will hit "set -o pipefail" and silently die with no
+# useful output. Rather than fail invisibly, re-exec ourselves under a real
+# bash before anything else runs.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "hypr-switch requires bash, but bash was not found on PATH." >&2
+        exit 1
+    fi
+fi
+# -----------------------------------------------------------------------------
+
+set -uo pipefail
+
+SHELLS_DIR="$HOME/.config/hypr/shells"
+HYPR_DIR="$HOME/.config/hypr"
+CURRENT_FILE="$HYPR_DIR/.current_shell"
+
+# ---------------------------------------------------------------------------
+# Shell discovery — this runs fresh every single invocation.
+# hypr-switch never needs to be "told" about a shell in advance: any folder
+# under $SHELLS_DIR containing a hyprland.lua or hyprland.conf is treated as
+# a valid switch target automatically. Just mkdir the folder and drop a
+# config in it — no re-running an installer required.
+# ---------------------------------------------------------------------------
+discover_shells() {
+    declare -gA SHELL_CONFIGS=()
+    [[ -d "$SHELLS_DIR" ]] || return 0
+    local dir name
+    for dir in "$SHELLS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        name="$(basename "$dir")"
+        if [[ -f "$dir/hyprland.lua" ]]; then
+            SHELL_CONFIGS["$name"]="hyprland.lua"
+        elif [[ -f "$dir/hyprland.conf" ]]; then
+            SHELL_CONFIGS["$name"]="hyprland.conf"
+        fi
+        # Folders with neither file are silently skipped — not an error,
+        # just not yet a valid shell (e.g. mid-setup).
+    done
+}
+
+discover_shells
+
+if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
+    notify-send "hypr-switch" "No shells found in $SHELLS_DIR" --urgency=critical 2>/dev/null
+    echo "No shells found in $SHELLS_DIR" >&2
+    echo "Create one with: mkdir -p $SHELLS_DIR/<name> && put a hyprland.lua or hyprland.conf inside" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Argument handling
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    --help|-h)
+        echo "hypr-switch — switch between Hyprland shell configs"
+        echo ""
+        echo "Usage:"
+        echo "  hypr-switch              interactive picker (rofi)"
+        echo "  hypr-switch <name>       switch directly to shell <name>"
+        echo "  hypr-switch --list       list all discovered shells"
+        echo "  hypr-switch --reload     reload current config, no logout"
+        echo "  hypr-switch --help       show this message"
+        echo ""
+        echo "Discovered shells:"
+        for name in "${!SHELL_CONFIGS[@]}"; do
+            echo "  - $name (${SHELL_CONFIGS[$name]})"
+        done
+        exit 0
+        ;;
+    --list)
+        for name in "${!SHELL_CONFIGS[@]}"; do
+            echo "$name (${SHELL_CONFIGS[$name]})"
+        done
+        exit 0
+        ;;
+    --reload)
+        # Reload the currently active config in place, no shell switch, no logout.
+        # Tries every known reload method until one succeeds.
+        if hyprctl reload >/dev/null 2>&1; then
+            notify-send "hypr-switch" "Config reloaded" 2>/dev/null
+            exit 0
+        fi
+        if command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch 'hl.dsp.reload()' >/dev/null 2>&1; then
+            notify-send "hypr-switch" "Config reloaded" 2>/dev/null
+            exit 0
+        fi
+        notify-send "hypr-switch" "Reload failed — try switching shells instead" --urgency=critical 2>/dev/null
+        exit 1
+        ;;
+esac
+
+if [[ -z "${1:-}" ]]; then
+    if ! command -v rofi >/dev/null 2>&1; then
+        echo "rofi is not installed — pass a shell name directly instead:" >&2
+        echo "  hypr-switch <name>" >&2
+        echo "Discovered shells: ${!SHELL_CONFIGS[*]}" >&2
+        exit 1
+    fi
+    CHOICE=$(printf '%s\n' "${!SHELL_CONFIGS[@]}" | sort | rofi -dmenu -p "Switch Hyprland Shell: ")
+else
+    CHOICE="$1"
+fi
+
+[[ -z "$CHOICE" ]] && exit 0
+
+if [[ -z "${SHELL_CONFIGS[$CHOICE]:-}" ]]; then
+    notify-send "hypr-switch" "Unknown shell: '$CHOICE'" --urgency=critical 2>/dev/null
+    echo "Unknown shell: '$CHOICE'" >&2
+    echo "Discovered shells: ${!SHELL_CONFIGS[*]}" >&2
+    exit 1
+fi
+
+CONFIG_FILENAME="${SHELL_CONFIGS[$CHOICE]}"
+TARGET="$SHELLS_DIR/$CHOICE/$CONFIG_FILENAME"
+
+if [[ ! -f "$TARGET" ]]; then
+    notify-send "hypr-switch" "Config file missing: $TARGET" --urgency=critical 2>/dev/null
+    exit 1
+fi
+
+# Don't do anything at all if we're already on this shell
+if [[ -f "$CURRENT_FILE" ]] && [[ "$(cat "$CURRENT_FILE" 2>/dev/null)" == "$CHOICE" ]]; then
+    notify-send "hypr-switch" "Already on $CHOICE" 2>/dev/null
+    exit 0
+fi
+
+# Remove both possible symlink filenames so switching between a .conf shell
+# and a .lua shell is always clean, regardless of direction.
+rm -f "$HYPR_DIR/hyprland.lua"
+rm -f "$HYPR_DIR/hyprland.conf"
+
+ln -sf "$TARGET" "$HYPR_DIR/$CONFIG_FILENAME"
+echo "$CHOICE" > "$CURRENT_FILE"
+
+notify-send "hypr-switch" "Switched to $CHOICE — logging out now to apply" 2>/dev/null
+sleep 1.5
+
+# ---------------------------------------------------------------------------
+# Logout / session restart — tried as a fallback chain.
+# This is deliberately NOT just "run one command and hope". Different
+# session setups (uwsm vs plain, different Hyprland versions) support
+# different exit paths, so each is attempted in order of safety/correctness
+# until one actually succeeds. This lives in the script itself so it works
+# no matter which shell's keybind triggered it.
+# ---------------------------------------------------------------------------
+attempt_logout() {
+    # 1. uwsm-managed session: the wiki-recommended, safest method when uwsm
+    #    is present, since it brings the whole graphical + login session down
+    #    in order rather than yanking Hyprland out from under it.
+    if command -v uwsm >/dev/null 2>&1 && pgrep -x uwsm >/dev/null 2>&1; then
+        if uwsm stop 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 2. Native Lua dispatcher exit (Hyprland 0.55+), issued via hyprctl dispatch.
+    #    'hl.dsp.exit()' is the correct current syntax — the older bare
+    #    "exit" keyword is hyprlang-only and is rejected under Lua configs.
+    if command -v hyprctl >/dev/null 2>&1; then
+        if hyprctl dispatch 'hl.dsp.exit()' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # 3. Fallback for hyprlang/.conf-based shells still on the legacy dispatcher.
+    if command -v hyprctl >/dev/null 2>&1; then
+        if hyprctl dispatch exit >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # NOTE: an earlier version of this script included a 4th fallback using
+    # `loginctl terminate-user ""` as a last resort. That has been REMOVED.
+    # An empty string is not a well-defined argument for terminate-user, and
+    # depending on the systemd/logind version and PolicyKit rules in effect,
+    # its behavior is not guaranteed to be scoped to just the current user's
+    # session — it can escalate further than intended, including down a path
+    # that ends in a full system shutdown rather than a simple logout. A
+    # logout helper must never risk that, so this script now stops after
+    # exhausting the two safe, well-defined hyprctl methods above rather than
+    # reaching for anything broader.
+    return 1
+}
+
+if ! attempt_logout; then
+    notify-send "hypr-switch" "Switched to $CHOICE, but automatic logout failed — please log out manually" --urgency=critical 2>/dev/null
+    echo "Switched config to $CHOICE, but could not log out automatically." >&2
+    echo "Log out manually to apply the change." >&2
+    exit 1
