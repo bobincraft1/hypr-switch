@@ -413,10 +413,4 @@ No — switching triggers a full logout/relogin so the new shell starts with a c
 **Can I bind the switcher, terminal, lock, or logout to different keys?**
 Yes — edit that keybind line directly in each shell's config after installation. The installer only sets sensible defaults; it doesn't enforce them.
 
----
-
-## License
-
-MIT — do whatever you want with this, no warranty provided. See `LICENSE` if included, or treat this section as the license text if not.
-
 
