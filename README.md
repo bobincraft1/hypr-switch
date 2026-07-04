@@ -24,6 +24,7 @@ Shells are **auto-discovered from disk every time `hypr-switch` runs.** There is
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
+- [License](#license)
 
 ---
 
@@ -83,7 +84,7 @@ sudo pacman -S rofi libnotify
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/bobincraft1/hypr-switch.git
+   git clone https://github.com/YOUR_USERNAME/hypr-switch.git
    cd hypr-switch
    ```
 
@@ -105,7 +106,19 @@ sudo pacman -S rofi libnotify
    ./install-hypr-switch.sh skwd brainshell
    ```
 
-4. If a shell name you passed doesn't have an existing config yet, the installer will ask:
+   The installer does not just copy the file and assume it worked. It verifies, in order: the copy actually landed and matches the source byte-for-byte, the executable bit is actually set (not just that `chmod` returned success), and that `hypr-switch` genuinely runs (`hypr-switch --help`) — catching issues like `noexec`-mounted filesystems or Windows line endings before they become a confusing "command not found" later. It then checks whether `~/.local/bin` is on `PATH`, and if not, patches the config file for **whichever shell you actually have** — `fish`, `bash`, and `zsh` are all handled, not just one — and verifies afterward that `hypr-switch` actually resolves by name. If any of this fails, the installer prints a specific error explaining what to do rather than reporting false success. This all works correctly even if the installer itself is invoked through a non-bash shell.
+
+4. **If you already have a working Hyprland config** at `~/.config/hypr/hyprland.lua` or `~/.config/hypr/hyprland.conf` — a real file, from before you started using hypr-switch — the installer automatically preserves it rather than leaving it invisible and unmanaged:
+
+   - It's moved into `~/.config/hypr/shells/default/`, with its content and filename completely unchanged
+   - The original location is replaced with a symlink pointing at the new location, so **your current setup keeps working immediately** — nothing about your actual config changes, only where the file physically lives
+   - `default` immediately shows up as a normal shell in `hypr-switch --list`, with no extra registration required, since shell discovery is purely filesystem-based
+
+   This only happens once. If `~/.config/hypr/hyprland.lua`/`.conf` is already a symlink (e.g. hypr-switch created it on an earlier run, or you already switched shells at least once), it's left alone — the installer explicitly checks `! -L` (not a symlink) before touching anything, specifically so this step can never re-process or clobber a config hypr-switch is already managing. Re-running the installer is always safe.
+
+   If you have no pre-existing config (a fresh Hyprland install), this step does nothing and prints a short confirmation that there was nothing to back up — it's not an error.
+
+5. If a shell name you passed doesn't have an existing config yet, the installer will ask:
 
    ```
    No config found for 'dots'.
@@ -114,15 +127,20 @@ sudo pacman -S rofi libnotify
 
    Answer `lua` or `conf` and a minimal, working skeleton config is generated for you automatically, with the switcher, terminal, lock, and logout keybinds already installed.
 
-5. If a shell name you passed **does** already have a config sitting in `~/.config/hypr/shells/<name>/`, the installer detects it and injects only the missing keybinds — nothing you've already written is touched or overwritten.
+6. If a shell name you passed **does** already have a config sitting in `~/.config/hypr/shells/<name>/`, the installer detects it and injects only the missing keybinds — nothing you've already written is touched or overwritten.
 
-6. Create the initial active symlink (pick whichever shell you want to boot into first):
+7. Create the initial active symlink (pick whichever shell you want to boot into first):
 
    ```bash
    hypr-switch skwd
    ```
 
    This will log you out. Log back in and you'll be in the `skwd` shell.
+
+   If your pre-existing config was preserved as `default` in step 4, you can switch straight back to exactly what you had before at any time with:
+   ```bash
+   hypr-switch default
+   ```
 
 That's it — installation is complete.
 
@@ -338,6 +356,13 @@ After uninstalling, you must manually point Hyprland at a real config again befo
 ln -sf ~/.config/hypr/shells/<name>/hyprland.lua ~/.config/hypr/hyprland.lua
 ```
 
+If you chose to keep your shell configs during uninstall and your original pre-hypr-switch config was auto-backed-up as `default` at install time (see [Installation](#installation), step 4), it's still sitting safely at `~/.config/hypr/shells/default/` — nothing is deleted by choosing to keep configs, only the now-dangling symlink is removed. Restore it as a real file directly, rather than a symlink, if you're leaving hypr-switch behind for good:
+
+```bash
+mv ~/.config/hypr/shells/default/hyprland.lua ~/.config/hypr/hyprland.lua
+# or hyprland.conf, whichever filetype it is
+```
+
 ---
 
 ## Troubleshooting
@@ -345,71 +370,4 @@ ln -sf ~/.config/hypr/shells/<name>/hyprland.lua ~/.config/hypr/hyprland.lua
 **`hypr-switch --list` (or any command) prints nothing at all, no error, no output**
 This was a real bug found and fixed: if `hypr-switch` is ever invoked through a POSIX shell (`sh`) instead of `bash` — which can happen depending on how a keybind, launcher, or exec wrapper spawns commands, regardless of the `#!/usr/bin/env bash` shebang at the top of the file — the script used to die immediately and silently at `set -uo pipefail`, since plain `sh` doesn't support the `pipefail` option. This looked exactly like "only remembers one shell" or "forgets shells I added," because nothing after that line ever ran, including discovery.
 
-This is fixed in the current version: the script now detects whether it's actually running under `bash` (checking `$BASH_VERSION`) and re-executes itself under a real `bash` if not, before anything else happens. If you're still on an older copy, replace `~/.local/bin/hypr-switch` with the latest version from this repo and try again — if it was this bug, it's now fixed regardless of how anything calls it.
-
-**"No shells found" error**
-`~/.config/hypr/shells/` is empty or doesn't exist, or none of its subfolders contain a `hyprland.lua`/`hyprland.conf`. Create at least one:
-```bash
-mkdir -p ~/.config/hypr/shells/myshell
-cp /path/to/config ~/.config/hypr/shells/myshell/hyprland.lua
-```
-
-**"Config file missing" notification when switching**
-The target shell's folder exists but the `hyprland.lua`/`.conf` file inside it doesn't. Check with:
-```bash
-ls ~/.config/hypr/shells/<name>/
-```
-
-**`hypr-switch: command not found`**
-`~/.local/bin` isn't in your `PATH`. The installer attempts to add it automatically for `fish` via `fish_add_path`. For other shells, add manually:
-```bash
-# bash/zsh — add to ~/.bashrc or ~/.zshrc
-export PATH="$HOME/.local/bin:$PATH"
-```
-Then restart your terminal or `source` the file.
-
-**rofi picker doesn't open**
-Confirm rofi is installed (`which rofi`). If you don't want to install rofi at all, just always pass the shell name directly (`hypr-switch skwd`) instead of running it bare, or use `hypr-switch --list` to see valid names.
-
-**"Switched to X, but automatic logout failed" notification**
-This means both logout methods in the fallback chain failed (see [How logout/reload actually works](#how-logoutreload-actually-works)) — most likely because neither `uwsm` nor a working `hyprctl` could be found or executed successfully. The shell config **has** already been switched successfully at this point; log out manually (e.g. through your greeter) to apply it.
-
-**Switched shells but nothing changed after relogin**
-Confirm the symlink actually updated:
-```bash
-ls -la ~/.config/hypr/hyprland.lua ~/.config/hypr/hyprland.conf
-```
-Exactly one of these two should exist and point at the shell you switched to. If both exist as real files (not symlinks), your setup was likely configured manually before installing hypr-switch — back them up, remove them, and recreate the symlink with `hypr-switch <name>`.
-
-**Sessions ending up in an inconsistent state after switching (uwsm users)**
-The Hyprland wiki specifically warns that uwsm users should avoid the raw `exit` dispatcher, since it can interfere with uwsm's ordered shutdown sequence. `hypr-switch` already tries `uwsm stop` first when uwsm is detected, which avoids this — but if you've customized the logout keybind in a shell config to call `hl.dsp.exit()` directly instead, switch it back to `uwsm stop`. If a session is already stuck, log out through your display manager/greeter or use a TTY (`Ctrl+Alt+F2`, etc.) to recover rather than a scripted systemd session command — see the warning above about why `loginctl terminate-user ""` was removed from this project entirely.
-
-**Leftover bar/daemon processes from the previous shell after switching**
-This means the previous shell's `exec-once` processes (waybar, quickshell, etc.) didn't fully terminate on logout. This is a session/compositor exit issue rather than a hypr-switch issue — confirm the correct logout method actually succeeded (check for a "Switched to X" vs. "automatic logout failed" notification), and check your display manager's session cleanup behavior.
-
----
-
-## FAQ
-
-**Can shells mix `.lua` and `.conf`?**
-Yes. Each shell's filetype is detected independently, fresh on every run — nothing is stored ahead of time. Switching from a `.conf` shell to a `.lua` shell (or vice versa) is handled correctly; both possible symlink filenames are checked and cleared before the new one is created.
-
-**Does this support more than two shells?**
-Yes, any number, and there's no fixed limit — just create more folders under `~/.config/hypr/shells/`.
-
-**Do I need to re-run the installer every time I add a shell?**
-No. This was a real limitation in earlier versions of this project and has been fixed. `hypr-switch` discovers shells directly from the filesystem on every single invocation — creating a new folder with a config inside it is immediately sufficient.
-
-**Will re-running the installer break my existing shells?**
-No. Existing config files are never overwritten — the installer only fills in keybinds that are detected as missing via `grep`, and only generates a full skeleton file when no config exists at all for that shell.
-
-**Does switching preserve my running applications?**
-No — switching triggers a full logout/relogin so the new shell starts with a clean slate. This is intentional; different shells often run incompatible bar/daemon processes that shouldn't coexist. Use `hypr-switch --reload` instead if you just want to apply a small edit to the *current* shell's config without switching or logging out.
-
-**What if none of the logout methods work on my system?**
-`hypr-switch` will tell you explicitly rather than fail silently — the config switch itself has already succeeded, you just need to log out manually the way you normally would (greeter, TTY, etc.) to apply it.
-
-**Can I bind the switcher, terminal, lock, or logout to different keys?**
-Yes — edit that keybind line directly in each shell's config after installation. The installer only sets sensible defaults; it doesn't enforce them.
-
-
+This is fixed in the current version
