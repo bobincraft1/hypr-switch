@@ -60,6 +60,31 @@ discover_shells() {
 
 discover_shells
 
+# --help/-h must always work, even on a brand new install with zero shells
+# configured yet — this is intentional and is what the installer relies on
+# to verify hypr-switch actually runs after copying it into place.
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "hypr-switch — switch between Hyprland shell configs"
+    echo ""
+    echo "Usage:"
+    echo "  hypr-switch              interactive picker (rofi)"
+    echo "  hypr-switch <name>       switch directly to shell <name>"
+    echo "  hypr-switch --list       list all discovered shells"
+    echo "  hypr-switch --reload     reload current config, no logout"
+    echo "  hypr-switch --help       show this message"
+    echo ""
+    if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
+        echo "No shells discovered yet in $SHELLS_DIR"
+        echo "Create one with: mkdir -p $SHELLS_DIR/<name> && put a hyprland.lua or hyprland.conf inside"
+    else
+        echo "Discovered shells:"
+        for name in "${!SHELL_CONFIGS[@]}"; do
+            echo "  - $name (${SHELL_CONFIGS[$name]})"
+        done
+    fi
+    exit 0
+fi
+
 if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
     notify-send "hypr-switch" "No shells found in $SHELLS_DIR" --urgency=critical 2>/dev/null
     echo "No shells found in $SHELLS_DIR" >&2
@@ -68,25 +93,10 @@ if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Argument handling
+# Remaining argument handling (--list, --reload). --help was already handled
+# above unconditionally, before the empty-shells check.
 # ---------------------------------------------------------------------------
 case "${1:-}" in
-    --help|-h)
-        echo "hypr-switch — switch between Hyprland shell configs"
-        echo ""
-        echo "Usage:"
-        echo "  hypr-switch              interactive picker (rofi)"
-        echo "  hypr-switch <name>       switch directly to shell <name>"
-        echo "  hypr-switch --list       list all discovered shells"
-        echo "  hypr-switch --reload     reload current config, no logout"
-        echo "  hypr-switch --help       show this message"
-        echo ""
-        echo "Discovered shells:"
-        for name in "${!SHELL_CONFIGS[@]}"; do
-            echo "  - $name (${SHELL_CONFIGS[$name]})"
-        done
-        exit 0
-        ;;
     --list)
         for name in "${!SHELL_CONFIGS[@]}"; do
             echo "$name (${SHELL_CONFIGS[$name]})"
