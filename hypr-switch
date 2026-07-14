@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
 #
-# hypr-switch — symlink-based shell switcher for Hyprland
+# hypr-switch v2 — capture-based, multi-app config switcher for Hyprland
 # https://github.com/bobincraft1/hypr-switch
 #
+# Architecture summary (see README for full detail):
+#   ~/.hypr-switch/                     <- all storage lives here, OUTSIDE ~/.config
+#     shells/<name>/configs/
+#       config/<app>/...                <- mirrors things under ~/.config
+#       home/<dotfile-or-dir>/...       <- mirrors a curated set of dotfiles in $HOME
+#     .current_shell
+#     .capture_state/                   <- only exists while a capture is in progress
+#
+# Every top-level entry under ~/.config, and every curated dotfile under $HOME
+# that hypr-switch manages, is ALWAYS a symlink pointing into shells/<active>/configs/.
+# This script is the only thing that should ever create/remove those symlinks.
+#
 # Usage:
-#   hypr-switch              interactive rofi picker
-#   hypr-switch <name>       switch directly to shell <name>
-#   hypr-switch --list       list all discovered shells
-#   hypr-switch --reload     reload the current config without switching (no logout)
-#   hypr-switch --help       show usage
+#   hypr-switch                       interactive picker (rofi)
+#   hypr-switch <name>                switch to shell <name>
+#   hypr-switch --list                list discovered shells
+#   hypr-switch --reload              reload current config, no logout
+#   hypr-switch --help                show usage
+#   hypr-switch bootstrap             one-time whole-~/.config capture as 'default'
+#   hypr-switch capture-start <name>  begin capturing a new/updated shell
+#   hypr-switch capture-finish <name> finish capturing, diff, claim, symlink
+#   hypr-switch capture-cancel        abort an in-progress capture, restore everything
+#   hypr-switch capture-status        show whether a capture is in progress
+#   hypr-switch show <name>           list what a shell owns
 #
 # --- Bash self-guard --------------------------------------------------------
-# This script REQUIRES bash (uses associative arrays, "set -o pipefail", etc).
-# If it's ever invoked via a POSIX shell instead of bash — e.g. something
-# calls it as `sh hypr-switch` rather than executing it directly, which can
-# happen depending on how a keybind/launcher/exec wrapper spawns commands —
-# a plain POSIX shell will hit "set -o pipefail" and silently die with no
-# useful output. Rather than fail invisibly, re-exec ourselves under a real
-# bash before anything else runs.
+# This script requires real bash: associative arrays, substring expansion,
+# process substitution, and nameref variables are all used below and are NOT
+# available under a POSIX /bin/sh. If invoked via sh (which can happen
+# depending on how a caller spawns commands, regardless of this file's own
+# shebang), re-exec under a real bash before anything else runs, rather than
+# fail with a cryptic "Bad substitution" partway through.
 if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
@@ -30,190 +47,908 @@ fi
 
 set -uo pipefail
 
-SHELLS_DIR="$HOME/.config/hypr/shells"
-HYPR_DIR="$HOME/.config/hypr"
-CURRENT_FILE="$HYPR_DIR/.current_shell"
+# dotglob: makes bare `*` globs match dotfiles too (e.g. .zshrc), which every
+# entry in WATCHED_HOME_ITEMS is. Without this, `for entry in "$dir"/*` would
+# silently skip every home-scope item in list_shell_items and elsewhere —
+# confirmed as a real bug during testing, not a hypothetical. This does NOT
+# make globs match "." or ".." themselves (verified empirically) — safe.
+shopt -s dotglob
 
 # ---------------------------------------------------------------------------
-# Shell discovery — this runs fresh every single invocation.
-# hypr-switch never needs to be "told" about a shell in advance: any folder
-# under $SHELLS_DIR containing a hyprland.lua or hyprland.conf is treated as
-# a valid switch target automatically. Just mkdir the folder and drop a
-# config in it — no re-running an installer required.
+# Constants
 # ---------------------------------------------------------------------------
-discover_shells() {
-    declare -gA SHELL_CONFIGS=()
-    [[ -d "$SHELLS_DIR" ]] || return 0
-    local dir name
-    for dir in "$SHELLS_DIR"/*/; do
-        [[ -d "$dir" ]] || continue
-        name="$(basename "$dir")"
-        if [[ -f "$dir/hyprland.lua" ]]; then
-            SHELL_CONFIGS["$name"]="hyprland.lua"
-        elif [[ -f "$dir/hyprland.conf" ]]; then
-            SHELL_CONFIGS["$name"]="hyprland.conf"
-        fi
-        # Folders with neither file are silently skipped — not an error,
-        # just not yet a valid shell (e.g. mid-setup).
+STORAGE_ROOT="$HOME/.hypr-switch"
+SHELLS_DIR="$STORAGE_ROOT/shells"
+CURRENT_SHELL_FILE="$STORAGE_ROOT/.current_shell"
+CAPTURE_STATE_DIR="$STORAGE_ROOT/.capture_state"
+CANCELLED_HOLDING_DIR="$STORAGE_ROOT/.cancelled"
+CONFIG_DIR="$HOME/.config"
+
+# Curated, explicit list of dotfiles/dirs directly under $HOME that hypr-switch
+# is willing to watch and capture. This list is intentionally NOT "scan
+# everything in $HOME" — see the denylist below and the README for why.
+# Safe to edit: add or remove entries as your shells actually need.
+WATCHED_HOME_ITEMS=(
+    ".zshrc"
+    ".bashrc"
+    ".zshenv"
+    ".bash_profile"
+    ".themes"
+    ".icons"
+)
+
+# Hard denylist — these are NEVER captured under any circumstances, even if
+# accidentally added to WATCHED_HOME_ITEMS above. This is a backstop, not the
+# primary safety mechanism (the primary mechanism is that WATCHED_HOME_ITEMS
+# is curated and $HOME is never scanned wholesale).
+DENYLIST_HOME_ITEMS=(
+    ".ssh" ".gnupg" ".gpg" ".password-store" ".aws" ".gcloud" ".kube"
+    ".netrc" ".git-credentials" ".docker" ".hypr-switch"
+)
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+is_denied_home_item() {
+    local item_name="$1" d
+    for d in "${DENYLIST_HOME_ITEMS[@]}"; do
+        [[ "$item_name" == "$d" ]] && return 0
+    done
+    local lower="${item_name,,}"
+    case "$lower" in
+        *key*|*credential*|*secret*|*token*) return 0 ;;
+    esac
+    return 1
+}
+
+# scoped path examples: "config/kitty/kitty.conf", "home/.zshrc", "home/.themes/pack/gtk.css"
+# claim unit examples:  "config/kitty",             "home/.zshrc", "home/.themes"
+claim_unit_of() {
+    local scoped_path="$1"
+    local scope="${scoped_path%%/*}"
+    local rest="${scoped_path#*/}"
+    local second="${rest%%/*}"
+    printf '%s/%s' "$scope" "$second"
+}
+
+# claim unit -> real filesystem path ("config/kitty" -> $HOME/.config/kitty,
+# "home/.zshrc" -> $HOME/.zshrc)
+scoped_path_to_real_path() {
+    local scoped_path="$1"
+    local scope="${scoped_path%%/*}"
+    local rest="${scoped_path#*/}"
+    if [[ "$scope" == "config" ]]; then
+        printf '%s/%s' "$CONFIG_DIR" "$rest"
+    elif [[ "$scope" == "home" ]]; then
+        printf '%s/%s' "$HOME" "$rest"
+    else
+        return 1
+    fi
+}
+
+# Hashes a single real file or real directory tree, writing
+# "<sha256>\t<scoped_prefix>[/<relative>]" lines into output_file.
+# real_path may itself be a symlink to a directory — find -L follows it
+# correctly even as the starting path (verified empirically).
+# A broken symlink (neither -f nor -d resolvable) is NOT silently skipped:
+# it gets a sentinel hash derived from its recorded link target, so a
+# symlink appearing, disappearing, or changing target is still visible to
+# the before/after diff instead of vanishing from snapshots entirely.
+_hash_tree_into() {
+    local real_path="$1" scoped_prefix="$2" output_file="$3"
+    if [[ -f "$real_path" ]]; then
+        local h
+        h="$(sha256sum "$real_path" 2>/dev/null)"
+        h="${h:0:64}"
+        [[ -n "$h" ]] && printf '%s\t%s\n' "$h" "$scoped_prefix" >> "$output_file"
+    elif [[ -d "$real_path" ]]; then
+        local filepath rel h
+        while IFS= read -r -d '' filepath; do
+            rel="${filepath#"$real_path"/}"
+            h="$(sha256sum "$filepath" 2>/dev/null)"
+            h="${h:0:64}"
+            [[ -n "$h" ]] && printf '%s\t%s/%s\n' "$h" "$scoped_prefix" "$rel" >> "$output_file"
+        done < <(find -L "$real_path" -path "*/.git" -prune -o -type f -print0 2>/dev/null)
+    elif [[ -L "$real_path" ]]; then
+        local link_target h
+        link_target="$(readlink "$real_path" 2>/dev/null)"
+        h="$(printf 'BROKEN_SYMLINK:%s' "$link_target" | sha256sum)"
+        h="${h:0:64}"
+        printf '%s\t%s\n' "$h" "$scoped_prefix" >> "$output_file"
+    fi
+}
+
+# Full snapshot of everything hypr-switch is allowed to watch: every top-level
+# entry currently in ~/.config, plus every currently-existing WATCHED_HOME_ITEMS
+# entry (filtered through the denylist as a backstop).
+compute_snapshot() {
+    local output_file="$1"
+    : > "$output_file"
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            item_name="$(basename "$entry")"
+            _hash_tree_into "$entry" "config/$item_name" "$output_file"
+        done
+    fi
+
+    local item real
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        _hash_tree_into "$real" "home/$item" "$output_file"
     done
 }
 
-discover_shells
+# List the claim-unit names (e.g. "config/kitty", "home/.zshrc") a given shell
+# currently owns, one per line.
+list_shell_items() {
+    local shell_name="$1"
+    local base="$SHELLS_DIR/$shell_name/configs"
+    [[ -d "$base" ]] || return 0
+    local scope entry
+    for scope in config home; do
+        [[ -d "$base/$scope" ]] || continue
+        for entry in "$base/$scope"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            printf '%s/%s\n' "$scope" "$(basename "$entry")"
+        done
+    done
+}
 
-# --help/-h must always work, even on a brand new install with zero shells
-# configured yet — this is intentional and is what the installer relies on
-# to verify hypr-switch actually runs after copying it into place.
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "hypr-switch — switch between Hyprland shell configs"
+discover_shells() {
+    declare -gA VALID_SHELLS=()
+    [[ -d "$SHELLS_DIR" ]] || return 0
+    local dir shell_name count
+    for dir in "$SHELLS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        shell_name="$(basename "$dir")"
+        count="$(list_shell_items "$shell_name" | wc -l)"
+        [[ "$count" -gt 0 ]] && VALID_SHELLS["$shell_name"]="$count"
+    done
+}
+
+# Removes any .git directories found within a path after it's been moved
+# into storage. The .git exclusion in _hash_tree_into only affects what's
+# HASHED (for diffing purposes) — a whole-folder mv still physically carries
+# .git along for the ride unless explicitly stripped afterward. Repo
+# metadata/history has no business being duplicated into every shell that
+# happens to claim a folder some installer git-cloned into.
+_strip_git_dirs() {
+    local base_path="$1"
+    [[ -d "$base_path" ]] || return 0
+    local gitdir
+    while IFS= read -r -d '' gitdir; do
+        rm -rf "$gitdir"
+    done < <(find "$base_path" -name ".git" -type d -print0 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# Idempotent: safe to call repeatedly, no-ops if default already exists.
+# ---------------------------------------------------------------------------
+bootstrap_default() {
+    local default_configs="$SHELLS_DIR/default/configs"
+    local existing_count
+    existing_count="$(list_shell_items "default" | wc -l)"
+    if [[ "$existing_count" -gt 0 ]]; then
+        echo "'default' already bootstrapped ($existing_count item(s)) — skipping."
+        return 0
+    fi
+
+    mkdir -p "$default_configs/config" "$default_configs/home" "$CANCELLED_HOLDING_DIR"
+    local captured=0
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name dest
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            item_name="$(basename "$entry")"
+            if [[ -L "$entry" ]]; then
+                local resolved
+                resolved="$(readlink -f "$entry")"
+                if [[ ! -e "$resolved" ]]; then
+                    echo "  WARNING: config/$item_name is a broken symlink -> $(readlink "$entry"). Leaving untouched, not managed by hypr-switch." >&2
+                    continue
+                fi
+                case "$resolved" in
+                    "$STORAGE_ROOT"/*) continue ;;
+                esac
+            fi
+            dest="$default_configs/config/$item_name"
+            if [[ -e "$dest" ]]; then
+                echo "  WARNING: $dest already exists — skipping $entry." >&2
+                continue
+            fi
+            if ! mv "$entry" "$dest"; then
+                echo "  ERROR: failed to move $entry" >&2
+                continue
+            fi
+            if [[ -e "$entry" || -L "$entry" ]]; then
+                echo "  ERROR: $entry still present after move — not symlinking." >&2
+                continue
+            fi
+            if ! ln -s "$dest" "$entry"; then
+                echo "  ERROR: failed to symlink $entry" >&2
+                continue
+            fi
+            _strip_git_dirs "$dest"
+            captured=$((captured + 1))
+            echo "  captured: config/$item_name"
+        done
+    fi
+
+    local item real dest
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: home/$item is a broken symlink -> $(readlink "$real"). Leaving untouched, not managed by hypr-switch." >&2
+                continue
+            fi
+            case "$resolved" in
+                "$STORAGE_ROOT"/*) continue ;;
+            esac
+        fi
+        dest="$default_configs/home/$item"
+        if [[ -e "$dest" ]]; then
+            echo "  WARNING: $dest already exists — skipping $real." >&2
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        if ! mv "$real" "$dest"; then
+            echo "  ERROR: failed to move $real" >&2
+            continue
+        fi
+        if [[ -e "$real" || -L "$real" ]]; then
+            echo "  ERROR: $real still present after move — not symlinking." >&2
+            continue
+        fi
+        if ! ln -s "$dest" "$real"; then
+            echo "  ERROR: failed to symlink $real" >&2
+            continue
+        fi
+        _strip_git_dirs "$dest"
+        captured=$((captured + 1))
+        echo "  captured: home/$item"
+    done
+
+    echo "default" > "$CURRENT_SHELL_FILE"
+    echo "Bootstrap complete: $captured item(s) captured into 'default'."
+}
+
+# ---------------------------------------------------------------------------
+# capture-start <name>
+# ---------------------------------------------------------------------------
+cmd_capture_start() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: hypr-switch capture-start <shell-name>" >&2
+        exit 1
+    fi
+    if [[ "$name" == "default" ]]; then
+        echo "ERROR: 'default' is captured automatically at install time and cannot be re-captured." >&2
+        exit 1
+    fi
+    if [[ -d "$CAPTURE_STATE_DIR" ]]; then
+        local in_progress
+        in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+        echo "ERROR: a capture is already in progress for '$in_progress'." >&2
+        echo "Run 'hypr-switch capture-finish $in_progress' or 'hypr-switch capture-cancel' first." >&2
+        exit 1
+    fi
+    if [[ "$(list_shell_items "default" | wc -l)" -eq 0 ]]; then
+        echo "ERROR: 'default' has not been bootstrapped yet. Re-run the installer, or run: hypr-switch bootstrap" >&2
+        exit 1
+    fi
+
+    mkdir -p "$CAPTURE_STATE_DIR"
+    echo "$name" > "$CAPTURE_STATE_DIR/shell_name"
+    : > "$CAPTURE_STATE_DIR/restore_manifest"
+
+    echo "Preparing to capture '$name'..."
+    echo "De-symlinking currently managed items into real, writable copies..."
+    local desymlinked=0
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            item_name="$(basename "$entry")"
+            if [[ -L "$entry" ]]; then
+                local resolved
+                resolved="$(readlink -f "$entry")"
+                if [[ ! -e "$resolved" ]]; then
+                    echo "  WARNING: config/$item_name is a broken symlink -> $resolved. Leaving as-is." >&2
+                    continue
+                fi
+                printf '%s\t%s\n' "config/$item_name" "$resolved" >> "$CAPTURE_STATE_DIR/restore_manifest"
+                if ! rm -rf "$entry"; then
+                    echo "  ERROR: failed to remove symlink $entry" >&2
+                    continue
+                fi
+                if ! cp -a "$resolved" "$entry"; then
+                    echo "  ERROR: failed to copy $resolved to $entry" >&2
+                    continue
+                fi
+                desymlinked=$((desymlinked + 1))
+            else
+                echo "  NOTE: config/$item_name is not a symlink (unexpected) — leaving as-is; changes to it won't be captured." >&2
+            fi
+        done
+    fi
+
+    local item real
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: home/$item is a broken symlink -> $resolved. Leaving as-is." >&2
+                continue
+            fi
+            printf '%s\t%s\n' "home/$item" "$resolved" >> "$CAPTURE_STATE_DIR/restore_manifest"
+            if ! rm -rf "$real"; then
+                echo "  ERROR: failed to remove symlink $real" >&2
+                continue
+            fi
+            if ! cp -a "$resolved" "$real"; then
+                echo "  ERROR: failed to copy $resolved to $real" >&2
+                continue
+            fi
+            desymlinked=$((desymlinked + 1))
+        else
+            echo "  NOTE: home/$item is not a symlink (unexpected) — leaving as-is; changes to it won't be captured." >&2
+        fi
+    done
+
+    echo "De-symlinked $desymlinked item(s)."
+    compute_snapshot "$CAPTURE_STATE_DIR/before.snapshot"
+
     echo ""
-    echo "Usage:"
-    echo "  hypr-switch              interactive picker (rofi)"
-    echo "  hypr-switch <name>       switch directly to shell <name>"
-    echo "  hypr-switch --list       list all discovered shells"
-    echo "  hypr-switch --reload     reload current config, no logout"
-    echo "  hypr-switch --help       show this message"
-    echo ""
-    if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
-        echo "No shells discovered yet in $SHELLS_DIR"
-        echo "Create one with: mkdir -p $SHELLS_DIR/<name> && put a hyprland.lua or hyprland.conf inside"
+    echo "Ready. Now run '$name''s actual installer normally, exactly as its own instructions say."
+    echo "When it finishes, run:   hypr-switch capture-finish $name"
+    echo "If anything goes wrong:  hypr-switch capture-cancel"
+}
+
+# ---------------------------------------------------------------------------
+# capture-finish <name>
+# ---------------------------------------------------------------------------
+cmd_capture_finish() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: hypr-switch capture-finish <shell-name>" >&2
+        exit 1
+    fi
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "ERROR: no capture is currently in progress." >&2
+        exit 1
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "")"
+    if [[ "$in_progress" != "$name" ]]; then
+        echo "ERROR: a capture is in progress for '$in_progress', not '$name'." >&2
+        exit 1
+    fi
+
+    echo "Finishing capture for '$name'..."
+    compute_snapshot "$CAPTURE_STATE_DIR/after.snapshot"
+
+    declare -A BEFORE_HASH=()
+    declare -A AFTER_HASH=()
+    local hash path
+    while IFS=$'\t' read -r hash path; do
+        [[ -n "$path" ]] && BEFORE_HASH["$path"]="$hash"
+    done < "$CAPTURE_STATE_DIR/before.snapshot"
+    while IFS=$'\t' read -r hash path; do
+        [[ -n "$path" ]] && AFTER_HASH["$path"]="$hash"
+    done < "$CAPTURE_STATE_DIR/after.snapshot"
+
+    declare -A CLAIMED=()
+    local p
+    for p in "${!AFTER_HASH[@]}"; do
+        if [[ "${BEFORE_HASH[$p]:-__missing__}" != "${AFTER_HASH[$p]}" ]]; then
+            CLAIMED["$(claim_unit_of "$p")"]=1
+        fi
+    done
+    for p in "${!BEFORE_HASH[@]}"; do
+        if [[ -z "${AFTER_HASH[$p]+x}" ]]; then
+            CLAIMED["$(claim_unit_of "$p")"]=1
+        fi
+    done
+
+    # Independent re-verification pass: for every de-symlinked unit NOT
+    # already claimed by the diff above, re-hash its LIVE content directly
+    # from disk right now (not the in-memory arrays already used above) and
+    # compare against BEFORE_HASH for that unit's paths. This is a genuinely
+    # separate check, not a re-run of the same comparison — it exists so a
+    # bug in the diff logic above can't silently discard a real change.
+    # Anything that disagrees gets claimed defensively. Comparison is done
+    # via bash associative arrays, not grep/regex, to avoid fragile pattern
+    # matching (an earlier version of this used `grep -F ... "$"`, which is
+    # broken: -F treats `$` as a literal character, not an anchor).
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path recheck_file
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            [[ -n "${CLAIMED[$unit]:-}" ]] && continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            [[ -e "$real_path" || -L "$real_path" ]] || continue
+
+            recheck_file="$(mktemp)"
+            _hash_tree_into "$real_path" "$unit" "$recheck_file"
+
+            declare -A RECHECK_HASH=()
+            local rh_hash rh_path
+            while IFS=$'\t' read -r rh_hash rh_path; do
+                [[ -n "$rh_path" ]] && RECHECK_HASH["$rh_path"]="$rh_hash"
+            done < "$recheck_file"
+            rm -f "$recheck_file"
+
+            local really_same=1 rp bp
+            for rp in "${!RECHECK_HASH[@]}"; do
+                if [[ "${BEFORE_HASH[$rp]:-__missing__}" != "${RECHECK_HASH[$rp]}" ]]; then
+                    really_same=0
+                fi
+            done
+            for bp in "${!BEFORE_HASH[@]}"; do
+                if [[ "$bp" == "$unit" || "$bp" == "$unit"/* ]]; then
+                    if [[ -z "${RECHECK_HASH[$bp]+x}" ]]; then
+                        really_same=0
+                    fi
+                fi
+            done
+            unset RECHECK_HASH
+
+            if [[ "$really_same" -eq 0 ]]; then
+                echo "  NOTE: $unit differs on independent re-check — capturing defensively rather than discarding." >&2
+                CLAIMED["$unit"]=1
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    if [[ ${#CLAIMED[@]} -eq 0 ]]; then
+        echo "No changes detected — nothing captured for '$name'."
     else
-        echo "Discovered shells:"
-        for name in "${!SHELL_CONFIGS[@]}"; do
-            echo "  - $name (${SHELL_CONFIGS[$name]})"
+        echo "Claimed for '$name':"
+        local unit
+        for unit in "${!CLAIMED[@]}"; do
+            echo "  - $unit"
+        done
+        echo ""
+    fi
+
+    local target_dir="$SHELLS_DIR/$name/configs"
+    if [[ ${#CLAIMED[@]} -gt 0 ]]; then
+        mkdir -p "$target_dir/config" "$target_dir/home"
+    fi
+
+    local unit real_path dest_path
+    for unit in "${!CLAIMED[@]}"; do
+        real_path="$(scoped_path_to_real_path "$unit")"
+        dest_path="$target_dir/$unit"
+        if [[ ! -e "$real_path" ]]; then
+            echo "  WARNING: $unit (resolved: $real_path) no longer exists — skipping." >&2
+            continue
+        fi
+        if [[ -e "$dest_path" ]]; then
+            echo "  WARNING: $dest_path already exists — skipping $unit to avoid overwrite." >&2
+            continue
+        fi
+        mkdir -p "$(dirname "$dest_path")"
+        if ! mv "$real_path" "$dest_path"; then
+            echo "  ERROR: mv failed for $unit" >&2
+            continue
+        fi
+        if [[ -e "$real_path" ]]; then
+            echo "  ERROR: $real_path still exists post-move — refusing to symlink over it." >&2
+            continue
+        fi
+        if ! ln -s "$dest_path" "$real_path"; then
+            echo "  ERROR: ln failed for $unit" >&2
+            continue
+        fi
+        _strip_git_dirs "$dest_path"
+        if [[ "$(readlink -f "$real_path")" == "$(readlink -f "$dest_path")" ]]; then
+            echo "  captured: $unit"
+        else
+            echo "  ERROR: symlink verification failed for $unit" >&2
+        fi
+    done
+
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            [[ -n "${CLAIMED[$unit]:-}" ]] && continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            rm -rf "$real_path"
+            if ! ln -s "$original_target" "$real_path"; then
+                echo "  ERROR: failed to restore symlink for $unit" >&2
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    rm -rf "$CAPTURE_STATE_DIR"
+    echo ""
+    echo "Capture finished for '$name'. ${#CLAIMED[@]} item(s) captured."
+    if [[ ${#CLAIMED[@]} -gt 0 ]]; then
+        echo ""
+        echo "Note: the captured item(s) are live right now so you can inspect them,"
+        echo "but 'hypr-switch --list' / .current_shell still shows your previous shell"
+        echo "until you formally switch. Run 'hypr-switch $name' to commit to it (will"
+        echo "log you out), or 'hypr-switch default' to fully revert everything captured."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# capture-cancel
+# ---------------------------------------------------------------------------
+cmd_capture_cancel() {
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "No capture is currently in progress." >&2
+        exit 1
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+    echo "Cancelling capture for '$in_progress'..."
+
+    local stamp holding
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    holding="$CANCELLED_HOLDING_DIR/${in_progress}-${stamp}"
+    # Deliberately NOT pre-creating $holding/config and $holding/home here —
+    # each actual relocation site below creates its own parent directory
+    # lazily via mkdir -p right before its mv. Pre-creating them here would
+    # leave two permanently-empty subdirectories even when nothing is ever
+    # relocated, defeating the empty-holding-dir cleanup at the end of this
+    # function (confirmed directly: this was a real bug caught by testing).
+
+    declare -A RESTORED=()
+
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            RESTORED["$unit"]=1
+            if [[ -e "$real_path" ]]; then
+                # Only preserve this de-symlinked copy if it's genuinely
+                # different from the original it came from — an unmodified
+                # item is just a redundant duplicate of what's already
+                # safely stored at original_target, so it's discarded
+                # directly rather than cluttering the holding area with an
+                # identical copy (confirmed via direct testing: without this
+                # check, EVERY cancel relocated EVERY managed item, even
+                # completely untouched ones, since capture-start de-symlinks
+                # everything unconditionally regardless of what actually
+                # changes).
+                if diff -rq "$real_path" "$original_target" >/dev/null 2>&1; then
+                    rm -rf "$real_path"
+                else
+                    mkdir -p "$(dirname "$holding/$unit")"
+                    mv "$real_path" "$holding/$unit" 2>/dev/null
+                fi
+            fi
+            if ! ln -s "$original_target" "$real_path"; then
+                echo "  ERROR: failed to restore symlink for $unit" >&2
+            else
+                echo "  restored: $unit"
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name unit real_path
+        # This loop is only looking for genuinely NEW real content the
+        # installer created (no restore_manifest entry exists for it, since
+        # it didn't exist at capture-start). It deliberately excludes ALL
+        # symlinks via the -L check below, including broken ones — any
+        # symlink here was either already handled by the restore_manifest
+        # loop above, or was never something hypr-switch touched at all.
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" ]] || continue
+            [[ -L "$entry" ]] && continue
+            item_name="$(basename "$entry")"
+            unit="config/$item_name"
+            [[ -n "${RESTORED[$unit]:-}" ]] && continue
+            mkdir -p "$holding/config"
+            mv "$entry" "$holding/$unit" 2>/dev/null
+            echo "  relocated new/unclaimed item to holding area: $unit"
         done
     fi
-    exit 0
-fi
+    local item real unit
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" ]] || continue
+        [[ -L "$real" ]] && continue
+        unit="home/$item"
+        [[ -n "${RESTORED[$unit]:-}" ]] && continue
+        is_denied_home_item "$item" && continue
+        mkdir -p "$(dirname "$holding/$unit")"
+        mv "$real" "$holding/$unit" 2>/dev/null
+        echo "  relocated new/unclaimed item to holding area: $unit"
+    done
 
-if [[ ${#SHELL_CONFIGS[@]} -eq 0 ]]; then
-    notify-send "hypr-switch" "No shells found in $SHELLS_DIR" --urgency=critical 2>/dev/null
-    echo "No shells found in $SHELLS_DIR" >&2
-    echo "Create one with: mkdir -p $SHELLS_DIR/<name> && put a hyprland.lua or hyprland.conf inside" >&2
-    exit 1
-fi
+    rm -rf "$CAPTURE_STATE_DIR"
+    echo ""
+    echo "Capture cancelled. Original state restored."
+
+    # Only mention/keep the holding area if something was actually relocated
+    # into it — an empty timestamped folder left behind on every cancel would
+    # just be clutter with nothing to recover.
+    if find "$holding" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+        echo "Anything the installer wrote was preserved (not deleted) at:"
+        echo "  $holding"
+    else
+        rm -rf "$holding"
+    fi
+}
 
 # ---------------------------------------------------------------------------
-# Remaining argument handling (--list, --reload). --help was already handled
-# above unconditionally, before the empty-shells check.
+# capture-status
 # ---------------------------------------------------------------------------
-case "${1:-}" in
-    --list)
-        for name in "${!SHELL_CONFIGS[@]}"; do
-            echo "$name (${SHELL_CONFIGS[$name]})"
-        done
+cmd_capture_status() {
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "No capture is currently in progress."
+        return 0
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+    echo "Capture in progress for: $in_progress"
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        echo "De-symlinked items (will be restored automatically unless changed):"
+        local unit rest
+        while IFS=$'\t' read -r unit rest; do
+            [[ -n "$unit" ]] && echo "  - $unit"
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+    echo ""
+    echo "Next steps:"
+    echo "  hypr-switch capture-finish $in_progress    (after running the installer)"
+    echo "  hypr-switch capture-cancel                 (to abort)"
+}
+
+# ---------------------------------------------------------------------------
+# show <name>
+# ---------------------------------------------------------------------------
+cmd_show() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: hypr-switch show <shell-name>" >&2
+        exit 1
+    fi
+    local items
+    items="$(list_shell_items "$name")"
+    if [[ -z "$items" ]]; then
+        echo "'$name' owns no items (does it exist? try: hypr-switch --list)" >&2
+        exit 1
+    fi
+    echo "'$name' owns:"
+    echo "$items" | sed 's/^/  - /'
+}
+
+# ---------------------------------------------------------------------------
+# switch <name> — the actual shell/config switch, folder-level, with default
+# fallback for anything the target shell doesn't itself own.
+# ---------------------------------------------------------------------------
+do_switch() {
+    local target="$1"
+
+    if [[ -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "ERROR: a capture is currently in progress — finish or cancel it before switching." >&2
+        echo "  hypr-switch capture-status" >&2
+        exit 1
+    fi
+
+    discover_shells
+    if [[ -z "${VALID_SHELLS[$target]:-}" ]]; then
+        echo "ERROR: unknown shell '$target'." >&2
+        echo "Known shells: ${!VALID_SHELLS[*]}" >&2
+        exit 1
+    fi
+
+    local current=""
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || echo "")"
+    if [[ "$current" == "$target" ]]; then
+        notify-send "hypr-switch" "Already on $target" 2>/dev/null
+        echo "Already on $target."
         exit 0
-        ;;
-    --reload)
-        # Reload the currently active config in place, no shell switch, no logout.
-        # Tries every known reload method until one succeeds.
-        if hyprctl reload >/dev/null 2>&1; then
-            notify-send "hypr-switch" "Config reloaded" 2>/dev/null
-            exit 0
-        fi
-        if command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch 'hl.dsp.reload()' >/dev/null 2>&1; then
-            notify-send "hypr-switch" "Config reloaded" 2>/dev/null
-            exit 0
-        fi
-        notify-send "hypr-switch" "Reload failed — try switching shells instead" --urgency=critical 2>/dev/null
-        exit 1
-        ;;
-esac
-
-if [[ -z "${1:-}" ]]; then
-    if ! command -v rofi >/dev/null 2>&1; then
-        echo "rofi is not installed — pass a shell name directly instead:" >&2
-        echo "  hypr-switch <name>" >&2
-        echo "Discovered shells: ${!SHELL_CONFIGS[*]}" >&2
-        exit 1
     fi
-    CHOICE=$(printf '%s\n' "${!SHELL_CONFIGS[@]}" | sort | rofi -dmenu -p "Switch Hyprland Shell: ")
-else
-    CHOICE="$1"
-fi
 
-[[ -z "$CHOICE" ]] && exit 0
+    declare -A TARGET_UNITS=()
+    local u
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && TARGET_UNITS["$u"]="default"
+    done < <(list_shell_items "default")
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && TARGET_UNITS["$u"]="$target"
+    done < <(list_shell_items "$target")
 
-if [[ -z "${SHELL_CONFIGS[$CHOICE]:-}" ]]; then
-    notify-send "hypr-switch" "Unknown shell: '$CHOICE'" --urgency=critical 2>/dev/null
-    echo "Unknown shell: '$CHOICE'" >&2
-    echo "Discovered shells: ${!SHELL_CONFIGS[*]}" >&2
-    exit 1
-fi
+    echo "Switching to '$target'..."
+    local unit owner desired_source real_path
+    for unit in "${!TARGET_UNITS[@]}"; do
+        owner="${TARGET_UNITS[$unit]}"
+        desired_source="$SHELLS_DIR/$owner/configs/$unit"
+        real_path="$(scoped_path_to_real_path "$unit")"
 
-CONFIG_FILENAME="${SHELL_CONFIGS[$CHOICE]}"
-TARGET="$SHELLS_DIR/$CHOICE/$CONFIG_FILENAME"
+        if [[ -L "$real_path" ]] && [[ "$(readlink -f "$real_path")" == "$(readlink -f "$desired_source")" ]]; then
+            continue
+        fi
 
-if [[ ! -f "$TARGET" ]]; then
-    notify-send "hypr-switch" "Config file missing: $TARGET" --urgency=critical 2>/dev/null
-    exit 1
-fi
+        if [[ -e "$real_path" && ! -L "$real_path" ]]; then
+            echo "  WARNING: $unit ($real_path) is a real file/directory, not a symlink — refusing to touch it to avoid data loss. Investigate manually." >&2
+            continue
+        fi
 
-# Don't do anything at all if we're already on this shell
-if [[ -f "$CURRENT_FILE" ]] && [[ "$(cat "$CURRENT_FILE" 2>/dev/null)" == "$CHOICE" ]]; then
-    notify-send "hypr-switch" "Already on $CHOICE" 2>/dev/null
-    exit 0
-fi
+        rm -f "$real_path"
+        mkdir -p "$(dirname "$real_path")"
+        if ! ln -s "$desired_source" "$real_path"; then
+            echo "  ERROR: failed to symlink $unit" >&2
+            continue
+        fi
+    done
 
-# Remove both possible symlink filenames so switching between a .conf shell
-# and a .lua shell is always clean, regardless of direction.
-rm -f "$HYPR_DIR/hyprland.lua"
-rm -f "$HYPR_DIR/hyprland.conf"
+    echo "$target" > "$CURRENT_SHELL_FILE"
+    notify-send "hypr-switch" "Switched to $target — logging out now to apply" 2>/dev/null
+    sleep 1.5
 
-ln -sf "$TARGET" "$HYPR_DIR/$CONFIG_FILENAME"
-echo "$CHOICE" > "$CURRENT_FILE"
-
-notify-send "hypr-switch" "Switched to $CHOICE — logging out now to apply" 2>/dev/null
-sleep 1.5
+    attempt_logout
+}
 
 # ---------------------------------------------------------------------------
-# Logout / session restart — tried as a fallback chain.
-# This is deliberately NOT just "run one command and hope". Different
-# session setups (uwsm vs plain, different Hyprland versions) support
-# different exit paths, so each is attempted in order of safety/correctness
-# until one actually succeeds. This lives in the script itself so it works
-# no matter which shell's keybind triggered it.
+# Logout fallback chain (unchanged in spirit from v1 — see README for why
+# a 4th 'loginctl terminate-user ""' method was deliberately removed after a
+# confirmed incident where it caused a full shutdown instead of a logout).
 # ---------------------------------------------------------------------------
 attempt_logout() {
-    # 1. uwsm-managed session: the wiki-recommended, safest method when uwsm
-    #    is present, since it brings the whole graphical + login session down
-    #    in order rather than yanking Hyprland out from under it.
     if command -v uwsm >/dev/null 2>&1 && pgrep -x uwsm >/dev/null 2>&1; then
         if uwsm stop 2>/dev/null; then
             return 0
         fi
     fi
-
-    # 2. Native Lua dispatcher exit (Hyprland 0.55+), issued via hyprctl dispatch.
-    #    'hl.dsp.exit()' is the correct current syntax — the older bare
-    #    "exit" keyword is hyprlang-only and is rejected under Lua configs.
     if command -v hyprctl >/dev/null 2>&1; then
         if hyprctl dispatch 'hl.dsp.exit()' >/dev/null 2>&1; then
             return 0
         fi
     fi
-
-    # 3. Fallback for hyprlang/.conf-based shells still on the legacy dispatcher.
     if command -v hyprctl >/dev/null 2>&1; then
         if hyprctl dispatch exit >/dev/null 2>&1; then
             return 0
         fi
     fi
-
-    # NOTE: an earlier version of this script included a 4th fallback using
-    # `loginctl terminate-user ""` as a last resort. That has been REMOVED.
-    # An empty string is not a well-defined argument for terminate-user, and
-    # depending on the systemd/logind version and PolicyKit rules in effect,
-    # its behavior is not guaranteed to be scoped to just the current user's
-    # session — it can escalate further than intended, including down a path
-    # that ends in a full system shutdown rather than a simple logout. A
-    # logout helper must never risk that, so this script now stops after
-    # exhausting the two safe, well-defined hyprctl methods above rather than
-    # reaching for anything broader.
+    notify-send "hypr-switch" "Switched, but automatic logout failed — please log out manually" --urgency=critical 2>/dev/null
+    echo "Switched successfully, but could not log out automatically." >&2
+    echo "Log out manually to apply the change." >&2
     return 1
 }
 
-if ! attempt_logout; then
-    notify-send "hypr-switch" "Switched to $CHOICE, but automatic logout failed — please log out manually" --urgency=critical 2>/dev/null
-    echo "Switched config to $CHOICE, but could not log out automatically." >&2
-    echo "Log out manually to apply the change." >&2
+# ---------------------------------------------------------------------------
+# --reload
+# ---------------------------------------------------------------------------
+do_reload() {
+    if hyprctl reload >/dev/null 2>&1; then
+        notify-send "hypr-switch" "Config reloaded" 2>/dev/null
+        echo "Config reloaded."
+        exit 0
+    fi
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch 'hl.dsp.reload()' >/dev/null 2>&1; then
+        notify-send "hypr-switch" "Config reloaded" 2>/dev/null
+        echo "Config reloaded."
+        exit 0
+    fi
+    notify-send "hypr-switch" "Reload failed — try switching shells instead" --urgency=critical 2>/dev/null
+    echo "Reload failed." >&2
     exit 1
+}
+
+# ---------------------------------------------------------------------------
+# --help
+# ---------------------------------------------------------------------------
+print_help() {
+    discover_shells
+    echo "hypr-switch — capture-based config switcher for Hyprland"
+    echo ""
+    echo "Usage:"
+    echo "  hypr-switch                       interactive picker (rofi)"
+    echo "  hypr-switch <name>                switch to shell <name>"
+    echo "  hypr-switch --list                list discovered shells"
+    echo "  hypr-switch --reload              reload current config, no logout"
+    echo "  hypr-switch --help                show this message"
+    echo "  hypr-switch bootstrap             one-time whole-config capture as 'default'"
+    echo "  hypr-switch capture-start <name>  begin capturing a new/updated shell"
+    echo "  hypr-switch capture-finish <name> finish capturing, diff, claim, symlink"
+    echo "  hypr-switch capture-cancel        abort an in-progress capture"
+    echo "  hypr-switch capture-status        show whether a capture is in progress"
+    echo "  hypr-switch show <name>           list what a shell owns"
+    echo ""
+    if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+        echo "No shells discovered yet. Run: hypr-switch bootstrap"
+    else
+        echo "Discovered shells:"
+        local n
+        for n in "${!VALID_SHELLS[@]}"; do
+            echo "  - $n (${VALID_SHELLS[$n]} item(s))"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+mkdir -p "$STORAGE_ROOT" "$SHELLS_DIR" 2>/dev/null
+
+case "${1:-}" in
+    --help|-h)
+        print_help
+        exit 0
+        ;;
+    bootstrap)
+        bootstrap_default
+        exit $?
+        ;;
+    capture-start)
+        cmd_capture_start "${2:-}"
+        exit $?
+        ;;
+    capture-finish)
+        cmd_capture_finish "${2:-}"
+        exit $?
+        ;;
+    capture-cancel)
+        cmd_capture_cancel
+        exit $?
+        ;;
+    capture-status)
+        cmd_capture_status
+        exit $?
+        ;;
+    show)
+        cmd_show "${2:-}"
+        exit $?
+        ;;
+    --list)
+        discover_shells
+        if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+            echo "No shells discovered. Run: hypr-switch bootstrap" >&2
+            exit 1
+        fi
+        for n in "${!VALID_SHELLS[@]}"; do
+            echo "$n (${VALID_SHELLS[$n]} item(s))"
+        done
+        exit 0
+        ;;
+    --reload)
+        do_reload
+        ;;
+esac
+
+discover_shells
+if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+    notify-send "hypr-switch" "No shells found — run: hypr-switch bootstrap" --urgency=critical 2>/dev/null
+    echo "No shells discovered yet. Run: hypr-switch bootstrap" >&2
+    exit 1
+fi
+
+if [[ -z "${1:-}" ]]; then
+    if ! command -v rofi >/dev/null 2>&1; then
+        echo "rofi is not installed — pass a shell name directly instead:" >&2
+        echo "  hypr-switch <name>" >&2
+        echo "Known shells: ${!VALID_SHELLS[*]}" >&2
+        exit 1
+    fi
+    CHOICE="$(printf '%s\n' "${!VALID_SHELLS[@]}" | sort | rofi -dmenu -p 'Switch Hyprland Shell: ')"
+    [[ -z "$CHOICE" ]] && exit 0
+    do_switch "$CHOICE"
+else
+    do_switch "$1"
+fi

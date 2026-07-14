@@ -1,45 +1,112 @@
 #!/usr/bin/env bash
 #
 # uninstall-hypr-switch.sh
-# Removes hypr-switch and optionally its shell configs.
+# Removes hypr-switch v2 cleanly. Unlike v1 (which only ever managed a single
+# hyprland.lua/.conf symlink), v2 may have symlinked many app folders across
+# ~/.config and several dotfiles in $HOME. This uninstaller de-symlinks every
+# currently-active item back into a REAL file/directory first — restoring
+# whatever content is currently live — so nothing is left broken afterward,
+# then optionally removes ~/.hypr-switch (all stored shells) entirely.
 #
-set -euo pipefail
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "This uninstaller requires bash, but bash was not found on PATH." >&2
+        exit 1
+    fi
+fi
 
-HYPR_DIR="$HOME/.config/hypr"
-SHELLS_DIR="$HYPR_DIR/shells"
-BIN_DIR="$HOME/.local/bin"
-SCRIPT_PATH="$BIN_DIR/hypr-switch"
-CURRENT_FILE="$HYPR_DIR/.current_shell"
+set -uo pipefail
+shopt -s dotglob
+
+STORAGE_ROOT="$HOME/.hypr-switch"
+BIN_PATH="$HOME/.local/bin/hypr-switch"
+CONFIG_DIR="$HOME/.config"
+
+# Must match hypr-switch's own WATCHED_HOME_ITEMS exactly, so every dotfile
+# it could possibly have symlinked is correctly found and restored here too.
+WATCHED_HOME_ITEMS=(
+    ".zshrc" ".bashrc" ".zshenv" ".bash_profile" ".themes" ".icons"
+)
 
 echo "== hypr-switch uninstaller =="
 echo ""
-echo "This will remove:"
-echo "  - $SCRIPT_PATH"
-echo "  - $CURRENT_FILE"
-echo "  - the active hyprland.lua / hyprland.conf symlink in $HYPR_DIR"
-echo ""
-read -rp "Also delete all shell configs in $SHELLS_DIR ? [y/N]: " confirm
 
-rm -f "$SCRIPT_PATH"
-rm -f "$CURRENT_FILE"
-
-# Only remove the top-level config if it's a symlink (never touch a real file)
-for f in "$HYPR_DIR/hyprland.lua" "$HYPR_DIR/hyprland.conf"; do
-    if [[ -L "$f" ]]; then
-        rm -f "$f"
-        echo "Removed symlink: $f"
-    fi
-done
-
-if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    rm -rf "$SHELLS_DIR"
-    echo "Removed all shell configs in $SHELLS_DIR"
+if [[ ! -d "$STORAGE_ROOT" ]]; then
+    echo "No hypr-switch storage found at $STORAGE_ROOT — nothing to restore."
 else
-    echo "Kept shell configs in $SHELLS_DIR — delete manually if needed."
+    echo "Restoring every currently-symlinked item to a real file/directory"
+    echo "(preserving whatever content is currently active) before removing anything..."
+    echo ""
+
+    restored=0
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" ]] || continue
+            [[ -L "$entry" ]] || continue
+            resolved="$(readlink -f "$entry")"
+            case "$resolved" in
+                "$STORAGE_ROOT"/*)
+                    if [[ -e "$resolved" ]]; then
+                        rm -f "$entry"
+                        if cp -a "$resolved" "$entry"; then
+                            echo "  restored: config/$(basename "$entry")"
+                            restored=$((restored + 1))
+                        else
+                            echo "  ERROR: failed to restore $entry" >&2
+                        fi
+                    else
+                        echo "  WARNING: $entry is a broken symlink -> $resolved. Leaving as a dangling symlink; investigate manually." >&2
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" ]] || continue
+        [[ -L "$real" ]] || continue
+        resolved="$(readlink -f "$real")"
+        case "$resolved" in
+            "$STORAGE_ROOT"/*)
+                if [[ -e "$resolved" ]]; then
+                    rm -f "$real"
+                    if cp -a "$resolved" "$real"; then
+                        echo "  restored: home/$item"
+                        restored=$((restored + 1))
+                    else
+                        echo "  ERROR: failed to restore $real" >&2
+                    fi
+                else
+                    echo "  WARNING: $real is a broken symlink -> $resolved. Leaving as a dangling symlink; investigate manually." >&2
+                fi
+                ;;
+        esac
+    done
+
+    echo ""
+    echo "Restored $restored item(s) to real files/directories."
+fi
+
+rm -f "$BIN_PATH"
+echo "Removed: $BIN_PATH"
+
+echo ""
+if [[ -d "$STORAGE_ROOT" ]]; then
+    read -rp "Also delete all stored shells (everything under $STORAGE_ROOT, including 'default')? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -rf "$STORAGE_ROOT"
+        echo "Removed: $STORAGE_ROOT"
+    else
+        echo "Kept: $STORAGE_ROOT (your other captured shells are still there if you reinstall later)"
+    fi
 fi
 
 echo ""
 echo "== Uninstall complete =="
-echo "Note: your active hyprland.lua/.conf symlink is gone."
-echo "You'll need to point Hyprland at a config manually before your next login,"
-echo "e.g.: ln -sf $SHELLS_DIR/<shell>/hyprland.lua $HYPR_DIR/hyprland.lua"
+echo "Your currently-active configuration is now made of ordinary real files"
+echo "again — nothing under ~/.config or your dotfiles depends on hypr-switch"
+echo "anymore, whether or not you chose to keep $STORAGE_ROOT."
